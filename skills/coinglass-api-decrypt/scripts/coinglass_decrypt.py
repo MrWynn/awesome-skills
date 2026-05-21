@@ -11,7 +11,7 @@ Usage examples:
 
     python coinglass_decrypt.py 1 --pretty
 
-    python coinglass_decrypt.py --pageNum 2 --pageSize 20 --pretty
+    python coinglass_decrypt.py --pageNum 2 --pageSize 20 --keyword hype --pretty
 
 Advanced: decrypt a captured response body and headers:
     Get-Content response.json | python coinglass_decrypt.py --headers headers.json --url "https://capi.coinglass.com/api/home/v2/coinMarkets"
@@ -169,7 +169,7 @@ def cryptojs_aes_ecb_decrypt(encrypted: bytes, key: bytes) -> bytes:
 
 def load_json(path: str | None) -> Any:
     try:
-        raw = sys.stdin.read() if not path or path == "-" else Path(path).read_text(encoding="utf-8")
+        raw = sys.stdin.read() if not path or path == "-" else Path(path).read_text(encoding="utf-8-sig")
     except FileNotFoundError as exc:
         raise DecodeError(f"File not found: {path}") from exc
     except OSError as exc:
@@ -204,6 +204,18 @@ def strip_api_prefix(url: str) -> str:
     marker = "/api"
     if marker in path:
         path = path[path.index(marker) + len(marker) :]
+    return path.split("?", 1)[0]
+
+
+def api_path_for_key(url: str) -> str:
+    """
+    Frontend request interceptor keeps the `/api...` path and strips query
+    parameters before deriving the v=1 key.
+    """
+    path = urlsplit(url).path or url
+    marker = "/api"
+    if marker in path:
+        path = path[path.index(marker) :]
     return path.split("?", 1)[0]
 
 
@@ -287,7 +299,7 @@ def derive_initial_key(body: dict[str, Any], headers: dict[str, str], url: str |
     elif version == "1":
         if not url:
             raise DecodeError('response v is "1"; pass --url so the URL-derived key can be built.')
-        seed = strip_api_prefix(url)
+        seed = api_path_for_key(url)
     elif version == "2":
         seed = get_header(headers, "time")
     elif version == "55":
@@ -304,7 +316,7 @@ def derive_initial_key(body: dict[str, Any], headers: dict[str, str], url: str |
         )
 
     encoded = base64.b64encode(seed.encode("utf-8")).decode("ascii")
-    return encoded[:16] if version == "0" else encoded
+    return encoded[:16] if version in {"0", "1"} else encoded
 
 
 def decrypt_response(body: dict[str, Any], headers: dict[str, str], url: str | None) -> Any:
@@ -314,7 +326,8 @@ def decrypt_response(body: dict[str, Any], headers: dict[str, str], url: str | N
         return body
 
     initial_key = derive_initial_key(body, headers, url)
-    if str(headers.get("v", "")) == "0":
+    version = str(headers.get("v", ""))
+    if version in {"0", "1"}:
         final_key = decrypt_field(get_header(headers, "user"), initial_key)
     else:
         final_key = decrypt_field(get_header(headers, "time"), initial_key)
@@ -326,14 +339,14 @@ def decrypt_response(body: dict[str, Any], headers: dict[str, str], url: str | N
         return plaintext
 
 
-def build_markets_url(page_num: int, page_size: int) -> str:
+def build_markets_url(page_num: int, page_size: int, keyword: str = "") -> str:
     query = urlencode(
         {
             "pageNum": page_num,
             "pageSize": page_size,
             "sort": "",
             "order": "",
-            "keyword": "",
+            "keyword": keyword,
             "ex": "all",
         }
     )
@@ -381,6 +394,7 @@ def main() -> int:
     parser.add_argument("pageNum", nargs="?", type=int, help="Page number to fetch, for example: 1")
     parser.add_argument("--pageNum", dest="page_num_flag", type=int, help="Page number to fetch.")
     parser.add_argument("--pageSize", type=int, default=20, help="Page size. Default: 20")
+    parser.add_argument("--keyword", default="", help="Coin keyword filter, for example: hype")
     parser.add_argument("--obe", default=DEFAULT_OBE, help="CoinGlass obe request header.")
     parser.add_argument("--body", "-b", help="Advanced: response body JSON file. Use '-' to read stdin.")
     parser.add_argument("--headers", "-H", help="Advanced: response headers JSON file.")
@@ -401,7 +415,7 @@ def main() -> int:
                 raise DecodeError("pageNum must be >= 1.")
             if args.pageSize < 1:
                 raise DecodeError("pageSize must be >= 1.")
-            url = build_markets_url(page_num, args.pageSize)
+            url = build_markets_url(page_num, args.pageSize, args.keyword)
             body, headers = fetch_json(url, args.obe)
             result = decrypt_response(body, headers, url)
     except DecodeError as exc:

@@ -99,7 +99,7 @@ time
 If the API returns only `{"code":"0","msg":"success","success":true}`, the
 request is usually missing a runtime header such as `obe` or `cache-ts-v2`.
 
-## Current Decrypt Chain
+## Current Decrypt Chains
 
 For currently observed `v=0` / `ev=2` responses:
 
@@ -110,6 +110,23 @@ dataKey = gzip_decompress(dataKeyGzip)
 plaintextGzip = AES-ECB-PKCS7-Decrypt(base64(data), dataKey)
 plaintextJson = JSON.parse(gzip_decompress(plaintextGzip))
 ```
+
+As of 2026-05-21, `/api/home/v2/coinMarkets` may also return `v=1` / `ev=2`
+with `user` present and no `time` response header:
+
+```text
+urlSeed = "/api/home/v2/coinMarkets"
+initialKey = base64(urlSeed).slice(0, 16)
+dataKeyGzip = AES-ECB-PKCS7-Decrypt(base64(user), initialKey)
+dataKey = gzip_decompress(dataKeyGzip)
+plaintextGzip = AES-ECB-PKCS7-Decrypt(base64(data), dataKey)
+plaintextJson = JSON.parse(gzip_decompress(plaintextGzip))
+```
+
+If a script fails with `Missing response header: time`, first inspect the
+response headers. A response with `v=1`, `user` present, and `time` absent should
+be checked against the `v=1` chain above. In this branch, keep `/api` in the
+URL seed, strip query parameters, and slice the base64 seed to 16 characters.
 
 Algorithm notes:
 
