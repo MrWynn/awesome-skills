@@ -39,6 +39,38 @@ The bundled script targets:
 https://capi.coinglass.com/api/home/v2/coinMarkets
 ```
 
+## Example Request
+
+This is a typical captured browser request that can be used as input when
+creating an endpoint-specific decrypt script:
+
+```bash
+curl 'https://capi.coinglass.com/api/futures/liquidation/chart?symbol=&timeType=10&range=1d' \
+  -H 'accept: application/json' \
+  -H 'accept-language: zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7' \
+  -H 'cache-ts-v2: 1779334477963' \
+  -H 'encryption: true' \
+  -H 'language: zh' \
+  -H 'obe: s_25cab7edd3ce4bca96c62e694e6e907d' \
+  -H 'origin: https://www.coinglass.com' \
+  -H 'priority: u=1, i' \
+  -H 'referer: https://www.coinglass.com/' \
+  -H 'sec-ch-ua: "Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"' \
+  -H 'sec-ch-ua-mobile: ?0' \
+  -H 'sec-ch-ua-platform: "Windows"' \
+  -H 'sec-fetch-dest: empty' \
+  -H 'sec-fetch-mode: cors' \
+  -H 'sec-fetch-site: same-site' \
+  -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
+```
+
+For this endpoint, an endpoint-specific script should follow the naming
+convention:
+
+```text
+api_futures_liquidation_chart_decrypt.py
+```
+
 ## Required Request Context
 
 For reliable decryption, capture the full browser request and response context.
