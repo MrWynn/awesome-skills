@@ -26,20 +26,26 @@ import argparse
 import base64
 import binascii
 import json
+import re
 import sys
 import time
 import zlib
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import unquote, urlencode, urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 
-STATIC_KEY_V55 = "170b070da9654622"
+STATIC_VERSION_KEYS = {
+    "55": "170b070da9654622",
+    "66": "d6537d845a964081",
+    "77": "863f08689c97435b",
+}
 COINGLASS_HOME_MARKETS_URL = "https://capi.coinglass.com/api/home/v2/coinMarkets"
+COINGLASS_WEB_URL = "https://www.coinglass.com/zh"
 DEFAULT_OBE = "s_25cab7edd3ce4bca96c62e694e6e907d"
 
 
@@ -148,7 +154,7 @@ def inv_mix_columns(state: list[list[int]]) -> None:
 
 def cryptojs_aes_ecb_decrypt(encrypted: bytes, key: bytes) -> bytes:
     schedule, n_rounds = cryptojs_key_schedule(key)
-    out = bytearray()
+    out = []
     for block_start in range(0, len(encrypted), 16):
         block = encrypted[block_start : block_start + 16]
         if len(block) != 16:
@@ -287,6 +293,125 @@ def get_user_object(body: dict[str, Any], headers: dict[str, str]) -> dict[str, 
     return {}
 
 
+def js_base64_decode(value: str) -> bytes:
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/="
+    out = []
+    acc = 0
+    count = 0
+    for ch in value:
+        idx = alphabet.find(ch)
+        if idx < 0:
+            continue
+        if idx == 64:
+            break
+        acc = (64 * acc + idx) if count % 4 else idx
+        old_count = count
+        count += 1
+        if old_count % 4:
+            out.append((acc >> ((-2 * count) & 6)) & 0xFF)
+    return bytes(out)
+
+
+def rc4_decode(data: str, key: str) -> str:
+    key_bytes = key.encode("utf-8")
+    state = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + state[i] + key_bytes[i % len(key_bytes)]) % 256
+        state[i], state[j] = state[j], state[i]
+    i = j = 0
+    out = []
+    for char in data:
+        byte = ord(char)
+        i = (i + 1) % 256
+        j = (j + state[i]) % 256
+        state[i], state[j] = state[j], state[i]
+        out.append(chr(byte ^ state[(state[i] + state[j]) % 256]))
+    return "".join(out)
+
+
+def decode_bundle_string(table: list[str], call_index: str, rc4_key: str) -> str:
+    encoded = table[int(call_index) - 108]
+    decoded_bytes = js_base64_decode(encoded)
+    percent_encoded = "".join(f"%{byte:02x}" for byte in decoded_bytes)
+    utf8_text = unquote(percent_encoded)
+    return rc4_decode(utf8_text, rc4_key)
+
+
+def parse_js_string_array(value: str) -> list[str]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise DecodeError("Could not parse CoinGlass bundle string table.") from exc
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise DecodeError("CoinGlass bundle string table has an unexpected shape.")
+    return parsed
+
+
+def fetch_text(url: str, timeout: int = 30) -> str:
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def find_current_app_bundle_url() -> str:
+    html = fetch_text(COINGLASS_WEB_URL, timeout=20)
+    scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
+    for script in scripts:
+        if "/_next/static/chunks/pages/_app-" in script and script.endswith(".js"):
+            return urljoin(COINGLASS_WEB_URL, script)
+    raise DecodeError("Could not find the current CoinGlass _app bundle URL.")
+
+
+def extract_static_version_keys_from_bundle(bundle: str) -> dict[str, str]:
+    xt_match = re.search(r"function\s+Xt\(t,e\)\{(?P<body>.*?)function\s+\w+\(\)\{var t=(?P<table>\[.*?\]);return", bundle)
+    if not xt_match:
+        raise DecodeError("Could not find the CoinGlass decrypt key function in the current bundle.")
+
+    xt_body = xt_match.group("body")
+    table = parse_js_string_array(xt_match.group("table"))
+    object_match = re.search(r"r=\{(?P<object>.*?)\},i=", xt_body)
+    if not object_match:
+        raise DecodeError("Could not find the CoinGlass static key object in the current bundle.")
+
+    object_calls = re.findall(r"([A-Za-z_$][\w$]*):n\((\d+),\"([^\"]+)\"\)", object_match.group("object"))
+    branch_calls = re.findall(r't\.headers\.v,\"(\d+)\"\).*?i=r\[n\((\d+),\"([^\"]+)\"\)\]', xt_body)
+    branch_calls.extend(re.findall(r'"(\d+)"==t\[n\(\d+,\"[^\"]+\"\)\]\.v&&\(i=r\[n\((\d+),\"([^\"]+)\"\)\]\)', xt_body))
+    if not object_calls or not branch_calls:
+        raise DecodeError("Could not parse CoinGlass static key branches from the current bundle.")
+
+    for shift in range(len(table)):
+        rotated = table[shift:] + table[:shift]
+        try:
+            key_object = {
+                prop: decode_bundle_string(rotated, index, rc4_key)
+                for prop, index, rc4_key in object_calls
+            }
+            version_keys = {}
+            for version, index, rc4_key in branch_calls:
+                prop = decode_bundle_string(rotated, index, rc4_key)
+                value = key_object.get(prop)
+                if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{16,32}", value):
+                    version_keys[version] = value
+        except (DecodeError, IndexError, UnicodeDecodeError, ValueError):
+            continue
+        if version_keys:
+            return version_keys
+
+    raise DecodeError("Could not decode CoinGlass static version keys from the current bundle.")
+
+
+def get_static_version_key(version: str) -> str | None:
+    if version in STATIC_VERSION_KEYS:
+        return STATIC_VERSION_KEYS[version]
+    try:
+        keys = extract_static_version_keys_from_bundle(fetch_text(find_current_app_bundle_url()))
+    except (DecodeError, OSError):
+        return None
+    STATIC_VERSION_KEYS.update(keys)
+    return STATIC_VERSION_KEYS.get(version)
+
+
 def derive_initial_key(body: dict[str, Any], headers: dict[str, str], url: str | None) -> str:
     user = get_user_object(body, headers)
 
@@ -302,21 +427,17 @@ def derive_initial_key(body: dict[str, Any], headers: dict[str, str], url: str |
         seed = api_path_for_key(url)
     elif version == "2":
         seed = get_header(headers, "time")
-    elif version == "55":
-        seed = STATIC_KEY_V55
-    elif version in {"66", "77"}:
-        raise DecodeError(
-            f'response v "{version}" uses a static key hidden in the current obfuscated bundle. '
-            "This script supports v=0, v=1, v=2, and v=55."
-        )
+    elif static_key := get_static_version_key(version):
+        seed = static_key
     else:
         raise DecodeError(
             f"Unsupported or missing response v value: {version!r}. "
-            "Save/pass the response headers; the data body alone is not enough."
+            "Save/pass the response headers; the data body alone is not enough. "
+            "If this is a new static-key version, rerun with network access so the current CoinGlass bundle can be parsed."
         )
 
     encoded = base64.b64encode(seed.encode("utf-8")).decode("ascii")
-    return encoded[:16] if version in {"0", "1"} else encoded
+    return encoded[:16]
 
 
 def decrypt_response(body: dict[str, Any], headers: dict[str, str], url: str | None) -> Any:
@@ -327,7 +448,7 @@ def decrypt_response(body: dict[str, Any], headers: dict[str, str], url: str | N
 
     initial_key = derive_initial_key(body, headers, url)
     version = str(headers.get("v", ""))
-    if version in {"0", "1"}:
+    if headers.get("user"):
         final_key = decrypt_field(get_header(headers, "user"), initial_key)
     else:
         final_key = decrypt_field(get_header(headers, "time"), initial_key)

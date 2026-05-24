@@ -110,6 +110,58 @@ Important details from the regression:
 - Validate by trying candidate seeds against the `user` header first. The
   correct seed should pass PKCS7 unpadding and then decrypt `data` to JSON.
 
+### Static-key versions such as v=55 / v=66 / v=77
+
+Some responses use a `v` value whose seed is a static key hidden in the current
+obfuscated frontend bundle. In the 2026-05-24 regression, the same endpoint
+returned `v=66` or `v=77`; the current bundle mapped:
+
+```text
+v=55 -> 170b070da9654622
+v=66 -> d6537d845a964081
+v=77 -> 863f08689c97435b
+```
+
+Use this workflow when a script says the current `v` uses a static key or when
+the response version changes unexpectedly:
+
+1. Reproduce with the exact request headers and print a small response header
+   subset: `v`, `ev`, `user`, `time`, `encryption`, plus the stored request
+   `cache-ts-v2`.
+2. Fetch `https://www.coinglass.com/zh` and locate the current Next.js app
+   chunk, usually shaped like:
+
+```text
+https://s3.coinglass.com/v1/cg/_next/static/chunks/pages/_app-<hash>.js
+```
+
+3. Inspect the app bundle for the response interceptor and the key selector
+   function. Useful strings before obfuscation or nearby decoded references
+   include `headers.v`, `headers.encryption`, `headers.user`,
+   `headers.time`, `AES.decrypt`, and `cache-ts-v2`.
+4. Find the function that switches on `response.headers.v`. In the observed
+   bundle it selected a seed, then returned `btoa(seed)`.
+5. For static versions, decode the obfuscated string table rather than guessing
+   the key. The observed bundle used a base64-like decoder plus RC4-style string
+   decoding. Pay attention to JavaScript operator precedence and `charCodeAt`
+   behavior when porting this decoder to Python.
+6. Derive the initial key as:
+
+```text
+initialKey = base64(seed).slice(0, 16)
+```
+
+7. Decrypt the second-stage key from response header `user` when present; fall
+   back to `time` only when `user` is absent. Then decrypt body `data` with the
+   second-stage key.
+8. Validate with a small live request, for example `pageSize=1`, so command
+   output truncation does not mask a broken pipe or partial failure.
+
+For reusable scripts, keep a local static mapping for currently observed
+versions, but also implement a runtime bundle parser for unknown static-key
+versions. CoinGlass may rotate the `v` branch or publish a new `_app-<hash>.js`
+without changing the API path.
+
 ## Algorithm Notes
 
 - AES mode: `ECB`
@@ -175,3 +227,8 @@ If names are obfuscated, inspect the function that selects the initial key by
 2026-05-21 regression, the request interceptor stripped query parameters, kept
 the `/api` prefix, and applied `.substring(0, 16)` to the base64 seed. Avoid
 relying on guessed field names.
+
+For static-key versions, do not stop at "unsupported v". Fetch the current app
+bundle, decode the string table around the `headers.v` key selector, recover
+the version-to-seed mapping, and verify the chain against `user` before trying
+to decrypt `data`.

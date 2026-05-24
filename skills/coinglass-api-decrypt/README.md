@@ -128,6 +128,33 @@ response headers. A response with `v=1`, `user` present, and `time` absent shoul
 be checked against the `v=1` chain above. In this branch, keep `/api` in the
 URL seed, strip query parameters, and slice the base64 seed to 16 characters.
 
+For static-key versions such as `v=55`, `v=66`, or `v=77`, the seed may be
+hidden in the current obfuscated frontend bundle. The reusable workflow is:
+
+1. Reproduce with exact request headers and print `v`, `ev`, `user`, `time`,
+   `encryption`, and the request `cache-ts-v2`.
+2. Fetch `https://www.coinglass.com/zh`, locate the current
+   `_next/static/chunks/pages/_app-<hash>.js` bundle, and inspect the response
+   interceptor around `headers.v`, `headers.user`, `headers.time`, and
+   `AES.decrypt`.
+3. Decode the obfuscated string table around the key selector instead of
+   guessing static keys. The 2026-05-24 bundle mapped:
+
+```text
+v=55 -> 170b070da9654622
+v=66 -> d6537d845a964081
+v=77 -> 863f08689c97435b
+```
+
+4. Derive `initialKey = base64(seed).slice(0, 16)`, decrypt `user` when present
+   to get the second-stage key, and fall back to `time` only when `user` is
+   absent.
+5. Validate with a small live request such as `pageSize=1` to avoid output
+   truncation hiding runtime failures.
+
+Reusable scripts should keep known static mappings locally, but also try to
+parse the current app bundle when an unknown static-key `v` appears.
+
 Algorithm notes:
 
 - AES mode: `ECB`
